@@ -498,10 +498,16 @@ func (t *TunnelEncapSubTLVSRv6BSID) DecodeFromBytes(data []byte) error {
 }
 
 func (t *TunnelEncapSubTLVSRv6BSID) Serialize() ([]byte, error) {
-	buf := make([]byte, t.Length)
+	l := 2
+	if t.BSID != nil {
+		l += t.BSID.Len()
+	}
+	buf := make([]byte, l) // 1st byte Flags, 2nd byte Reserved, 3rd+ BSID
 	buf[0] = t.Flags
-	copy(buf[2:t.BSID.Len()], t.BSID.Serialize())
-	return t.TunnelEncapSubTLV.Serialize(buf[:])
+	if t.BSID != nil {
+		copy(buf[2:], t.BSID.Serialize())
+	}
+	return t.TunnelEncapSubTLV.Serialize(buf)
 }
 
 func (t *TunnelEncapSubTLVSRv6BSID) String() string {

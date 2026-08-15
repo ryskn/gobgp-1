@@ -116,6 +116,40 @@ func TestSRBSIDNoBSIDRendering(t *testing.T) {
 	}
 }
 
+func TestSRv6BSIDRoundTrip(t *testing.T) {
+	sid := net.ParseIP("2001:db8:1:1::100").To16()
+	bsid, err := NewBSID(sid)
+	if err != nil {
+		t.Fatalf("NewBSID failed: %v", err)
+	}
+	input := &TunnelEncapSubTLVSRv6BSID{
+		TunnelEncapSubTLV: TunnelEncapSubTLV{
+			Type:   ENCAP_SUBTLV_TYPE_SRBINDING_SID,
+			Length: uint16(2 + bsid.Len()),
+		},
+		Flags: 0x0,
+		BSID:  bsid,
+	}
+
+	b, err := input.Serialize()
+	if err != nil {
+		t.Fatalf("Serialize failed: %v", err)
+	}
+	// Sub-TLV body: Flags(1) + Reserved(1) + BSID(16), after the 2-byte header.
+	if got := b[4:20]; !reflect.DeepEqual(got, []byte(sid)) {
+		t.Fatalf("serialized BSID does not carry the full SID:\nexpected: %v\ngot:      %v", sid, got)
+	}
+
+	result := &TunnelEncapSubTLVSRv6BSID{}
+	if err := result.DecodeFromBytes(b); err != nil {
+		t.Fatalf("DecodeFromBytes failed: %v", err)
+	}
+	if !reflect.DeepEqual(input.BSID.Value, result.BSID.Value) {
+		t.Logf("Diffs: %+v", deep.Equal(input.BSID.Value, result.BSID.Value))
+		t.Fatalf("expected BSID: %+v does not match result: %+v", input.BSID.Value, result.BSID.Value)
+	}
+}
+
 func TestSegmentListRoundTrip(t *testing.T) {
 	tests := []struct {
 		name  string
