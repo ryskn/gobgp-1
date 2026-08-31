@@ -16,13 +16,17 @@ package server
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"maps"
 	"math"
+	"net/netip"
 	"slices"
 	"sync"
 
 	"github.com/osrg/gobgp/v4/api"
 	"github.com/osrg/gobgp/v4/internal/pkg/netutils"
+	"github.com/osrg/gobgp/v4/pkg/config/oc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -232,6 +236,38 @@ func (c *tcpAoKeychain) toAPIKeychain() *api.TcpAoKeychain {
 	return result
 }
 
+// socketConfig returns the keys of the keychain in the form the socket helpers
+// expect. The master keys are copied so that a concurrent keychain update
+// cannot zero them while a socket operation is in flight. The caller must
+// release the copy with clearTcpAoKeys.
+//
+// preferredSendID selects the key the socket signs with. It must be nil for a
+// listening socket, which has no current key: an accepted connection signs with
+// the key that the peer requested in RNextKey.
+func (c *tcpAoKeychain) socketConfig(preferredSendID *uint8) netutils.TCPAOConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	config := netutils.TCPAOConfig{
+		Keys:            make([]netutils.TCPAOKey, 0, len(c.keys)),
+		PreferredSendID: preferredSendID,
+	}
+	for _, sendID := range slices.Sorted(maps.Keys(c.keys)) {
+		key := c.keys[sendID]
+		key.MasterKey = bytes.Clone(key.MasterKey)
+		config.Keys = append(config.Keys, key)
+	}
+	return config
+}
+
+func (c *tcpAoKeychain) hasSendID(sendID uint8) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	_, ok := c.keys[sendID]
+	return ok
+}
+
 func (c *tcpAoKeychain) getKey(sendID, receiveID uint8) (netutils.TCPAOKey, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -283,4 +319,102 @@ func (c *tcpAoKeychain) clearKeys() {
 		clear(key.MasterKey)
 	}
 	clear(c.keys)
+}
+
+// tcpAoPeerScope returns the TCP-AO key scope of one peer address. The kernel
+// selects keys by prefix, so a single peer becomes a host prefix. The IPv6 zone
+// of an unnumbered peer is dropped because a key scope cannot carry one.
+func tcpAoPeerScope(addr netip.Addr) netip.Prefix {
+	unzoned := addr.Unmap().WithZone("")
+	return netip.PrefixFrom(unzoned, unzoned.BitLen())
+}
+
+// resolveTcpAoKeychain looks up the keychain that a peer or a peer-group
+// references. TCP-AO is enabled by referencing a keychain, so an empty
+// reference resolves to no keychain.
+//
+// The reference is resolved when the configuration is accepted rather than when
+// the session is established, so that a keychain name or a send ID that does
+// not exist is reported to the caller that configured it.
+func resolveTcpAoKeychain(store *tcpAoKeychainStore, config *oc.TcpAoConfig, authPassword string) (*tcpAoKeychain, error) {
+	if config.Keychain == "" {
+		return nil, nil
+	}
+	if authPassword != "" {
+		// TCP-AO obsoletes the TCP MD5 signature option (RFC 5925, section 1)
+		// and Linux rejects both options on the same socket.
+		return nil, fmt.Errorf("TCP-AO and TCP MD5 authentication are mutually exclusive")
+	}
+	keychain, ok := store.getKeychain(string(config.Keychain))
+	if !ok {
+		return nil, fmt.Errorf("TCP-AO keychain %q does not exist", config.Keychain)
+	}
+	if !keychain.hasSendID(config.PreferredSendId) {
+		return nil, fmt.Errorf("TCP-AO keychain %q does not contain a key with send ID %d", config.Keychain, config.PreferredSendId)
+	}
+	return keychain, nil
+}
+
+// attachTcpAoListenerKeys installs the keys of a peer on the shared BGP
+// listening sockets. Linux authenticates the SYN of an incoming connection
+// against the listening socket and copies the matching keys to the accepted
+// socket, so the keys have to be installed before the peer connects. The keys
+// are scoped to the peer, which lets one listener carry the keys of every peer.
+func (s *BgpServer) attachTcpAoListenerKeys(scope netip.Prefix, bindInterface string, keychain *tcpAoKeychain) error {
+	config := keychain.socketConfig(nil)
+	defer clearTcpAoKeys(config.Keys)
+
+	for _, l := range s.listListeners(scope.Addr().String()) {
+		sc, err := l.SyscallConn()
+		if err == nil {
+			err = netutils.AddTCPAOKeysSockopt(sc, scope, bindInterface, config)
+		}
+		if err != nil {
+			// Do not leave a listener holding a part of the key set behind.
+			// Removing a key that was never installed fails, so the result of
+			// the rollback carries no information.
+			_ = s.deleteTcpAoListenerKeys(scope, bindInterface, config)
+			return err
+		}
+	}
+	return nil
+}
+
+// detachTcpAoListenerKeys removes the keys of a peer from the shared BGP
+// listening sockets. Connections that are already established keep their own
+// copy of the keys, so this only stops new connections from being accepted.
+func (s *BgpServer) detachTcpAoListenerKeys(scope netip.Prefix, bindInterface string, keychain *tcpAoKeychain) error {
+	config := keychain.socketConfig(nil)
+	defer clearTcpAoKeys(config.Keys)
+
+	return s.deleteTcpAoListenerKeys(scope, bindInterface, config)
+}
+
+func (s *BgpServer) deleteTcpAoListenerKeys(scope netip.Prefix, bindInterface string, config netutils.TCPAOConfig) error {
+	var errs []error
+	for _, l := range s.listListeners(scope.Addr().String()) {
+		sc, err := l.SyscallConn()
+		if err == nil {
+			err = netutils.DeleteTCPAOKeysSockopt(sc, scope, bindInterface, config)
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// tcpAoKeychainUser returns the name of a peer or peer-group that references the
+// given keychain. Removing a keychain zeroes its master keys, so a keychain that
+// is still referenced must not be removed.
+func (s *BgpServer) tcpAoKeychainUser(name string) string {
+	for addr, peer := range s.neighborMap {
+		if string(peer.fsm.pConf.ReadOnly().TcpAo.Config.Keychain) == name {
+			return fmt.Sprintf("neighbor %s", addr)
+		}
+	}
+	for pgName, pg := range s.peerGroupMap {
+		if string(pg.Conf.TcpAo.Config.Keychain) == name {
+			return fmt.Sprintf("peer-group %s", pgName)
+		}
+	}
+	return ""
 }

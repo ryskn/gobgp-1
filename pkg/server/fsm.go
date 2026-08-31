@@ -407,6 +407,12 @@ type fsm struct {
 	// config state messages statistics and timers state UpdateRecvTime are atomic
 	pConf pConfAccess
 
+	// tcpAoKeychain is the keychain the peer authenticates with, resolved when
+	// the peer is configured. It is nil unless the peer uses TCP-AO. Changing
+	// the keychain of a peer re-creates the peer, so the pointer is immutable
+	// once the FSM is started, while the keys inside the keychain can change.
+	tcpAoKeychain *tcpAoKeychain
+
 	capMap   map[bgp.BGPCapabilityCode][]bgp.ParameterCapabilityInterface
 	recvOpen *bgp.BGPMessage
 
@@ -888,6 +894,27 @@ func (h *fsmHandler) idle(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	}
 }
 
+// setTcpAoDialerKeys installs the keys of the peer on the socket of an outgoing
+// connection before it is connected. Unlike the listening socket, the
+// connecting socket selects the send key up front, because the SYN it sends
+// already has to carry the MAC of the key the peer is asked to reply with
+// (RFC 5925, section 7.3).
+//
+// The preferred send ID is read here rather than captured with the other
+// connection parameters so that a change of the send ID takes effect on the
+// next connection attempt without re-creating the peer.
+func (fsm *fsm) setTcpAoDialerKeys(sc syscall.RawConn, bindInterface string) error {
+	if fsm.tcpAoKeychain == nil {
+		return nil
+	}
+	conf := fsm.pConf.ReadOnly()
+	sendID := conf.TcpAo.Config.PreferredSendId
+	config := fsm.tcpAoKeychain.socketConfig(&sendID)
+	defer clearTcpAoKeys(config.Keys)
+
+	return netutils.AddTCPAOKeysSockopt(sc, tcpAoPeerScope(conf.State.NeighborAddress), bindInterface, config)
+}
+
 func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 	fsm := h.fsm
 
@@ -943,7 +970,10 @@ func (h *fsmHandler) connectLoop(ctx context.Context) net.Conn {
 				Timeout:   time.Duration(max(retryInterval-1, minConnectRetryInterval)) * time.Second,
 				KeepAlive: -1,
 				Control: func(network, address string, c syscall.RawConn) error {
-					return netutils.DialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface, tos)
+					if err := netutils.DialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface, tos); err != nil {
+						return err
+					}
+					return fsm.setTcpAoDialerKeys(c, bindInterface)
 				},
 			}
 

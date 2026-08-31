@@ -226,7 +226,12 @@ func (n *Neighbor) NeedsResendOpenMessage(new *Neighbor) bool {
 		!n.GracefulRestart.Config.Equal(&new.GracefulRestart.Config) ||
 		isAfiSafiChanged(n.AfiSafis, new.AfiSafis) ||
 		!n.EbgpMultihop.Config.Equal(&new.EbgpMultihop.Config) ||
-		!n.TtlSecurity.Config.Equal(&new.TtlSecurity.Config)
+		!n.TtlSecurity.Config.Equal(&new.TtlSecurity.Config) ||
+		// The keys of an established TCP-AO connection cannot be replaced, so a
+		// different keychain requires the session to be re-established. The
+		// preferred send ID is deliberately not part of this: it selects a key
+		// within the same keychain and is applied without a restart.
+		n.TcpAo.Config.Keychain != new.TcpAo.Config.Keychain
 }
 
 // TODO: these regexp are duplicated in api

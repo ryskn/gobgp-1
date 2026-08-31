@@ -3536,6 +3536,11 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 		return fmt.Errorf("can't be both route-server-client and route-reflector-client")
 	}
 
+	tcpAoKeychain, err := resolveTcpAoKeychain(s.keychainStore, &c.TcpAo.Config, c.Config.AuthPassword)
+	if err != nil {
+		return fmt.Errorf("failed to configure TCP-AO for %s: %w", addr, err)
+	}
+
 	if s.bgpConfig.Global.Config.Port > 0 {
 		for _, l := range s.listListeners(addr) {
 			if c.Config.AuthPassword != "" {
@@ -3545,6 +3550,15 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 						slog.String("Key", addr),
 						slog.String("Err", err.Error()))
 				}
+			}
+		}
+		if tcpAoKeychain != nil {
+			// Unlike a missing MD5 password, a listener that does not hold the
+			// keys of a peer does not fall back to an unauthenticated session,
+			// it drops the connection. Report the failure instead of
+			// configuring a peer that cannot be connected to.
+			if err := s.attachTcpAoListenerKeys(tcpAoPeerScope(netip.MustParseAddr(addr)), c.Transport.Config.BindInterface, tcpAoKeychain); err != nil {
+				return fmt.Errorf("failed to install TCP-AO keys for %s: %w", addr, err)
 			}
 		}
 	}
@@ -3560,6 +3574,9 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 	if err := s.policy.SetPeerPolicy(peer.ID(), c.ApplyPolicy); err != nil {
 		return fmt.Errorf("failed to set peer policy for %s: %v", addr, err)
 	}
+	// Set before the FSM is started, the outgoing connection reads the keychain
+	// from the FSM.
+	peer.fsm.tcpAoKeychain = tcpAoKeychain
 	s.neighborMap[netip.MustParseAddr(addr)] = peer
 	if name := c.Config.PeerGroup; name != "" {
 		s.peerGroupMap[name].AddMember(*c)
@@ -3673,9 +3690,21 @@ func (s *BgpServer) AddDynamicNeighbor(ctx context.Context, r *api.AddDynamicNei
 		if !ok {
 			return fmt.Errorf("no such peer-group: %s", c.Config.PeerGroup)
 		}
+		pConf := pg.Conf
+		// A dynamic neighbor is only ever accepted, so the keys of its
+		// peer-group are installed on the listeners and nowhere else. The scope
+		// is the whole prefix, matching how MD5 is configured below.
+		tcpAoKeychain, err := resolveTcpAoKeychain(s.keychainStore, &pConf.TcpAo.Config, pConf.Config.AuthPassword)
+		if err != nil {
+			return fmt.Errorf("failed to configure TCP-AO for %s: %w", p, err)
+		}
+		if tcpAoKeychain != nil {
+			if err := s.attachTcpAoListenerKeys(p.Masked(), pConf.Transport.Config.BindInterface, tcpAoKeychain); err != nil {
+				return fmt.Errorf("failed to install TCP-AO keys for %s: %w", p, err)
+			}
+		}
 		pg.AddDynamicNeighbor(c)
 
-		pConf := pg.Conf
 		if pConf.Config.AuthPassword != "" {
 			prefix := r.DynamicNeighbor.Prefix
 			addr, _, _ := net.ParseCIDR(prefix)
@@ -3741,6 +3770,14 @@ func (s *BgpServer) deleteNeighbor(c *oc.Neighbor, code, subcode uint8, sendNoti
 			}
 		}
 	}
+	// The keychain is taken from the peer rather than from c, because a caller
+	// that only identifies the peer, such as DeletePeer, passes a bare config.
+	if n.fsm.tcpAoKeychain != nil {
+		bindInterface := n.fsm.pConf.ReadOnly().Transport.Config.BindInterface
+		if err := s.detachTcpAoListenerKeys(tcpAoPeerScope(netip.MustParseAddr(addr)), bindInterface, n.fsm.tcpAoKeychain); err != nil {
+			n.fsm.logger.Warn("failed to remove TCP-AO keys", slog.String("Err", err.Error()))
+		}
+	}
 	n.fsm.logger.Info("Delete a peer configuration")
 
 	if sendNotification {
@@ -3796,6 +3833,22 @@ func (s *BgpServer) DeleteDynamicNeighbor(ctx context.Context, r *api.DeleteDyna
 		pg.DeleteDynamicNeighbor(r.Prefix)
 
 		pConf := pg.Conf
+		if pConf.TcpAo.Config.Keychain != "" {
+			if p, perr := netip.ParsePrefix(r.Prefix); perr != nil {
+				s.logger.Warn("Cannot clear up dynamic TCP-AO keys, invalid prefix",
+					slog.String("Topic", "Peer"),
+					slog.String("Key", r.Prefix),
+					slog.String("Err", perr.Error()),
+				)
+			} else if keychain, ok := s.keychainStore.getKeychain(string(pConf.TcpAo.Config.Keychain)); ok {
+				if err := s.detachTcpAoListenerKeys(p.Masked(), pConf.Transport.Config.BindInterface, keychain); err != nil {
+					s.logger.Warn("failed to remove TCP-AO keys",
+						slog.String("Topic", "Peer"),
+						slog.String("Key", r.Prefix),
+						slog.String("Err", err.Error()))
+				}
+			}
+		}
 		if pConf.Config.AuthPassword != "" {
 			prefix := r.Prefix
 			addr, _, perr := net.ParseCIDR(prefix)
@@ -3878,6 +3931,13 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 		return needsSoftResetIn, fmt.Errorf("neighbor that has %v doesn't exist", addr)
 	}
 
+	// Reject an unusable TCP-AO configuration before any part of the update is
+	// applied. A change of the keychain itself is handled by
+	// NeedsResendOpenMessage below, which re-creates the peer with the new keys.
+	if _, err := resolveTcpAoKeychain(s.keychainStore, &c.TcpAo.Config, c.Config.AuthPassword); err != nil {
+		return needsSoftResetIn, fmt.Errorf("failed to configure TCP-AO for %s: %w", addr, err)
+	}
+
 	peer.fsm.lock.Lock()
 	original := peer.fsm.pConf.ReadOnly()
 	conf := peer.fsm.pConf.ReadCopy()
@@ -3947,6 +4007,14 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 	if !original.Timers.Config.Equal(&c.Timers.Config) {
 		peer.fsm.logger.Info("Update timer configuration")
 		conf.Timers.Config = c.Timers.Config
+	}
+
+	// Only the preferred send ID can differ here, a keychain change is handled
+	// above. The established session keeps signing with the key it negotiated;
+	// the new send ID is used by the next connection attempt.
+	if !original.TcpAo.Config.Equal(&c.TcpAo.Config) {
+		peer.fsm.logger.Info("Update TCP-AO configuration")
+		conf.TcpAo.Config = c.TcpAo.Config
 	}
 
 	isLimit, err := peer.updatePrefixLimitConfig(&conf, c.AfiSafis)
@@ -5441,6 +5509,11 @@ func (s *BgpServer) DeleteTcpAoKeychain(_ context.Context, r *api.DeleteTcpAoKey
 	}
 
 	return s.mgmtOperation(func() error {
+		// Removing a keychain zeroes its master keys, which peers that still
+		// reference it would install on their next connection attempt.
+		if user := s.tcpAoKeychainUser(r.Name); user != "" {
+			return status.Errorf(codes.FailedPrecondition, "TCP-AO keychain %q is in use by %s", r.Name, user)
+		}
 		if !s.keychainStore.deleteKeychain(r.Name) {
 			return status.Errorf(codes.NotFound, "TCP-AO keychain %q does not exist", r.Name)
 		}

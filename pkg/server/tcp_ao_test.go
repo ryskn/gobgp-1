@@ -16,7 +16,9 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -319,4 +321,164 @@ func TestTcpAoKeychainOperations(t *testing.T) {
 	require.NoError(t, err)
 	_, err = stream.Recv()
 	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestTcpAoPeerScope(t *testing.T) {
+	tests := []struct {
+		addr string
+		want string
+	}{
+		{addr: "10.0.0.1", want: "10.0.0.1/32"},
+		{addr: "2001:db8::1", want: "2001:db8::1/128"},
+		// A TCP-AO scope carries neither an IPv6 zone nor a mapped IPv4 address.
+		{addr: "fe80::1%eth0", want: "fe80::1/128"},
+		{addr: "::ffff:10.0.0.1", want: "10.0.0.1/32"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			assert.Equal(t, tt.want, tcpAoPeerScope(netip.MustParseAddr(tt.addr)).String())
+		})
+	}
+}
+
+// newTcpAoTestServer starts a server without a listening socket, so that the
+// tests below exercise the configuration path on every platform. Installing
+// keys on a socket needs TCP-AO support from the kernel.
+func newTcpAoTestServer(t *testing.T) *BgpServer {
+	t.Helper()
+	s := NewBgpServer()
+	go s.Serve()
+	t.Cleanup(func() {
+		require.NoError(t, s.StopBgp(context.Background(), &api.StopBgpRequest{}))
+	})
+	require.NoError(t, s.StartBgp(context.Background(), &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        65001,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	}))
+	require.NoError(t, s.AddTcpAoKeychain(context.Background(), &api.AddTcpAoKeychainRequest{
+		Keychain: testTcpAoKeychain("chain"),
+	}))
+	return s
+}
+
+func tcpAoTestPeer(address string, tcpAo *api.TcpAoPeerConfig) *api.Peer {
+	return &api.Peer{
+		Conf: &api.PeerConf{
+			NeighborAddress: address,
+			PeerAsn:         65002,
+			AdminDown:       true,
+		},
+		TcpAo: tcpAo,
+	}
+}
+
+// peerTcpAoKeychain returns the keychain the FSM of a peer authenticates with.
+// The neighbor map is only safe to read from a management operation.
+func peerTcpAoKeychain(t *testing.T, s *BgpServer, address string) *tcpAoKeychain {
+	t.Helper()
+	var keychain *tcpAoKeychain
+	err := s.mgmtOperation(func() error {
+		peer, ok := s.neighborMap[netip.MustParseAddr(address)]
+		if !ok {
+			return fmt.Errorf("no such peer: %s", address)
+		}
+		keychain = peer.fsm.tcpAoKeychain
+		return nil
+	}, false)
+	require.NoError(t, err)
+	return keychain
+}
+
+func TestTcpAoPeerConfigRejected(t *testing.T) {
+	s := newTcpAoTestServer(t)
+
+	md5AndTcpAo := tcpAoTestPeer("10.0.0.4", &api.TcpAoPeerConfig{Keychain: "chain", PreferredSendId: 1})
+	md5AndTcpAo.Conf.AuthPassword = "password"
+
+	tests := []struct {
+		name string
+		peer *api.Peer
+		err  string
+	}{
+		{
+			name: "unknown keychain",
+			peer: tcpAoTestPeer("10.0.0.1", &api.TcpAoPeerConfig{Keychain: "missing", PreferredSendId: 1}),
+			err:  `TCP-AO keychain "missing" does not exist`,
+		},
+		{
+			name: "send ID not in keychain",
+			peer: tcpAoTestPeer("10.0.0.2", &api.TcpAoPeerConfig{Keychain: "chain", PreferredSendId: 7}),
+			err:  `TCP-AO keychain "chain" does not contain a key with send ID 7`,
+		},
+		{
+			name: "send ID out of range",
+			peer: tcpAoTestPeer("10.0.0.3", &api.TcpAoPeerConfig{Keychain: "chain", PreferredSendId: 256}),
+			err:  "TCP-AO preferred send ID 256 is outside 0..255",
+		},
+		{
+			name: "md5 and TCP-AO",
+			peer: md5AndTcpAo,
+			err:  "TCP-AO and TCP MD5 authentication are mutually exclusive",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.ErrorContains(t, s.AddPeer(context.Background(), &api.AddPeerRequest{Peer: tt.peer}), tt.err)
+			// The peer must not be configured when its keys cannot be resolved.
+			assert.Error(t, s.DeletePeer(context.Background(), &api.DeletePeerRequest{
+				Address: tt.peer.Conf.NeighborAddress,
+			}))
+		})
+	}
+}
+
+func TestTcpAoPeerConfigAccepted(t *testing.T) {
+	s := newTcpAoTestServer(t)
+
+	peer := tcpAoTestPeer("10.0.0.1", &api.TcpAoPeerConfig{Keychain: "chain", PreferredSendId: 1})
+	require.NoError(t, s.AddPeer(context.Background(), &api.AddPeerRequest{Peer: peer}))
+	keychain := peerTcpAoKeychain(t, s, "10.0.0.1")
+	require.NotNil(t, keychain)
+	assert.Equal(t, "chain", keychain.name)
+
+	// A keychain that a peer references cannot be removed, its master keys are
+	// still needed by the peer.
+	err := s.DeleteTcpAoKeychain(context.Background(), &api.DeleteTcpAoKeychainRequest{Name: "chain"})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	// An update that cannot be resolved leaves the peer untouched.
+	peer.TcpAo.PreferredSendId = 7
+	_, err = s.UpdatePeer(context.Background(), &api.UpdatePeerRequest{Peer: peer})
+	require.Error(t, err)
+	assert.Same(t, keychain, peerTcpAoKeychain(t, s, "10.0.0.1"))
+
+	require.NoError(t, s.DeletePeer(context.Background(), &api.DeletePeerRequest{Address: "10.0.0.1"}))
+	require.NoError(t, s.DeleteTcpAoKeychain(context.Background(), &api.DeleteTcpAoKeychainRequest{Name: "chain"}))
+}
+
+func TestTcpAoPeerGroupInheritance(t *testing.T) {
+	s := newTcpAoTestServer(t)
+
+	require.NoError(t, s.AddPeerGroup(context.Background(), &api.AddPeerGroupRequest{
+		PeerGroup: &api.PeerGroup{
+			Conf:  &api.PeerGroupConf{PeerGroupName: "group", PeerAsn: 65002},
+			TcpAo: &api.TcpAoPeerConfig{Keychain: "chain", PreferredSendId: 1},
+		},
+	}))
+
+	// The neighbor does not configure TCP-AO itself, it inherits the keychain
+	// of its peer-group.
+	peer := tcpAoTestPeer("10.0.0.1", nil)
+	peer.Conf.PeerGroup = "group"
+	require.NoError(t, s.AddPeer(context.Background(), &api.AddPeerRequest{Peer: peer}))
+
+	keychain := peerTcpAoKeychain(t, s, "10.0.0.1")
+	require.NotNil(t, keychain)
+	assert.Equal(t, "chain", keychain.name)
+
+	err := s.DeleteTcpAoKeychain(context.Background(), &api.DeleteTcpAoKeychainRequest{Name: "chain"})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
