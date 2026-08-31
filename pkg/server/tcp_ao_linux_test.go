@@ -32,7 +32,13 @@ import (
 // TCP-AO needs Linux 6.7 or newer built with CONFIG_TCP_AO.
 func requireTcpAoSupport(t *testing.T) {
 	t.Helper()
-	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	// Go 1.24+ listens with multipath TCP by default on Linux, and an MPTCP
+	// socket rejects the SOL_TCP TCP-AO options with ENOPROTOOPT, which this
+	// probe would misread as missing kernel support. The production listener
+	// disables MPTCP the same way (internal/pkg/netutils/listener.go).
+	var lc net.ListenConfig
+	lc.SetMultipathTCP(false)
+	l, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer l.Close()
 
